@@ -22,6 +22,15 @@ const ( // cmds
 const (
 	headerOverHeadSize = 1 + 4 + 2
 	maxFrameDataLen    = 0xFFFF // math.MaxUint16 — protocol max payload per frame
+
+	// h2MaxFramePayload is the default HTTP/2 MAX_FRAME_SIZE (16384).
+	// Data frames are chunked at this boundary so that each anytls
+	// cmdPSH frame produces one TLS record of ≤16 KB — matching the
+	// TLS record pattern of a real Go H2 DATA frame.  Go's crypto/tls
+	// already splits internally at 16 KB, so this adds zero extra TCP
+	// writes; the only cost is a few extra mutex acquisitions (~4 %
+	// CPU on loopback, invisible on any real network link).
+	h2MaxFramePayload = 16384
 )
 
 // frame defines a packet from or to be multiplexed into a single connection

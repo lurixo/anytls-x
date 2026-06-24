@@ -26,13 +26,20 @@ type Stream struct {
 
 	reportOnce sync.Once
 
+	// frameSeq counts data frames sent on this stream.  The first few
+	// frames (<= earlyDataFrames) carry the inner TLS handshake; the
+	// record shaper splits the inner ClientHello among several records
+	// so it no longer appears as a single ~517 B record (the headline
+	// TLS-in-TLS signature).  Stream.Write is single-goroutine, but an
+	// atomic counter is used for defence in depth.
+	frameSeq atomic.Uint32
+
 	// synTimer is the per-stream SYNACK timeout (client only, sid >= 2).
 	// Fires if the server does not acknowledge the stream within the deadline.
 	// Only closes this stream; may also close session if no SYNACK received.
 	synTimer *time.Timer
 }
 
-// newStream initiates a Stream struct
 func newStream(id uint32, sess *Session) *Stream {
 	s := new(Stream)
 	s.id = id
@@ -61,11 +68,12 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 	if ep := s.dieErr.Load(); ep != nil {
 		return 0, *ep
 	}
-	n, err = s.sess.writeDataFrame(s.id, b)
+	seq := s.frameSeq.Add(1)
+	early := seq <= earlyDataFrames
+	n, err = s.sess.writeDataFrameShaped(s.id, b, early)
 	return
 }
 
-// Close implements net.Conn
 func (s *Stream) Close() error {
 	return s.closeWithError(io.ErrClosedPipe)
 }
@@ -128,7 +136,6 @@ func (s *Stream) SetDeadline(t time.Time) error {
 	return s.SetReadDeadline(t)
 }
 
-// LocalAddr satisfies net.Conn interface
 func (s *Stream) LocalAddr() net.Addr {
 	if ts, ok := s.sess.conn.(interface {
 		LocalAddr() net.Addr
@@ -138,7 +145,6 @@ func (s *Stream) LocalAddr() net.Addr {
 	return nil
 }
 
-// RemoteAddr satisfies net.Conn interface
 func (s *Stream) RemoteAddr() net.Addr {
 	if ts, ok := s.sess.conn.(interface {
 		RemoteAddr() net.Addr

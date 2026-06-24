@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -60,15 +59,24 @@ type Session struct {
 	peerVersion atomic.Uint32
 
 	// client
-	client      *Client
-	isClient    bool
-	sendPadding bool
-	buffering   bool
-	buffer      []byte
-	pktCounter  atomic.Uint32
+	client    *Client
+	isClient  bool
+	buffering bool
+	buffer    []byte
+
+	shaper *RecordShaper
 
 	idleReady     chan struct{}
 	idleReadyOnce sync.Once
+	// idleLoopOnce keeps the lazy idleLoop start (see maybeStartIdleLoop) single-shot.
+	idleLoopOnce sync.Once
+
+	// WINDOW_UPDATE injection: recvBytes, wndUpdateBase and
+	// wndUpdateTrigger are only accessed by recvLoop (single goroutine),
+	// so no lock is needed.
+	recvBytes        int
+	wndUpdateBase    int
+	wndUpdateTrigger int
 
 	// server
 	onNewStream func(stream *Stream)
@@ -76,15 +84,19 @@ type Session struct {
 
 func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger) *Session {
 	s := &Session{
-		conn:        conn,
-		isClient:    true,
-		sendPadding: true,
-		padding:     _padding,
-		logger:      logger,
+		conn:     conn,
+		isClient: true,
+		padding:  _padding,
+		logger:   logger,
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
+	s.shaper = newRecordShaper(conn, _padding)
 	s.idleReady = make(chan struct{})
+	if cfg := _padding.Load().RecordConfig; cfg.WndUpdateInterval > 0 {
+		s.wndUpdateBase = cfg.WndUpdateInterval
+		s.wndUpdateTrigger = nextWndInterval(s.wndUpdateBase)
+	}
 	return s
 }
 
@@ -97,11 +109,18 @@ func NewServerSession(conn net.Conn, onNewStream func(stream *Stream), _padding 
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
+	s.shaper = newRecordShaper(conn, _padding)
 	s.idleReady = make(chan struct{})
+	if cfg := _padding.Load().RecordConfig; cfg.WndUpdateInterval > 0 {
+		s.wndUpdateBase = cfg.WndUpdateInterval
+		s.wndUpdateTrigger = nextWndInterval(s.wndUpdateBase)
+	}
 	return s
 }
 
 func (s *Session) Run() {
+	s.maybeStartIdleLoop()
+
 	if !s.isClient {
 		s.recvLoop()
 		return
@@ -111,6 +130,7 @@ func (s *Session) Run() {
 		"v":           "2",
 		"client":      util.Verison,
 		"padding-md5": s.padding.Load().Md5,
+		"rs":          "1",
 	}
 	f := newFrame(cmdSettings, 0)
 	f.data = settings.ToBytes()
@@ -121,7 +141,6 @@ func (s *Session) Run() {
 	go s.heartbeatLoop()
 }
 
-// IsClosed does a safe check to see if we have shutdown
 func (s *Session) IsClosed() bool {
 	select {
 	case <-s.die:
@@ -154,6 +173,24 @@ func (s *Session) Close() error {
 		s.streams = make(map[uint32]*Stream)
 		s.streamLock.Unlock()
 		s.conn.SetWriteDeadline(time.Now().Add(-time.Second)) // abort any stuck no-deadline write so connLock is obtainable
+		// Best-effort H2 GOAWAY before closing, emitted only if connLock is
+		// immediately available. The GOAWAY waste frame is pure camouflage
+		// (skipping it has no functional effect), so Close must never block
+		// waiting on a write stuck on the no-deadline data path — the same
+		// TryLock discipline writeWindowUpdateWaste already uses. If the lock
+		// is held, close the conn directly: the SetWriteDeadline above has
+		// already unblocked any in-flight write, and net.Conn.Close is safe
+		// to call concurrently with a Write in progress.
+		if s.connLock.TryLock() {
+			// Simulate H2 GOAWAY: emit a 17-byte waste frame before closing.
+			// H2 GOAWAY = 9B H2 header + 4B last-stream-id + 4B error-code = 17B.
+			// anytls: 7B header + 10B payload = 17B total, matching wire size.
+			// Best-effort; errors ignored since we're closing.
+			writeFrameBytes(s.conn, cmdWaste, 0, 10)
+			err := s.conn.Close()
+			s.connLock.Unlock()
+			return err
+		}
 		return s.conn.Close()
 	} else {
 		return io.ErrClosedPipe
@@ -237,11 +274,6 @@ func (s *Session) OpenStream(dieHook func()) (*Stream, error) {
 }
 
 func (s *Session) recvLoop() error {
-	// defer func() {
-	// 	if r := recover(); r != nil {
-	// 		logrus.Errorln("[BUG]", r, string(debug.Stack()))
-	// 	}
-	// }()
 	defer s.Close()
 
 	var receivedSettingsFromClient bool
@@ -251,7 +283,6 @@ func (s *Session) recvLoop() error {
 		if s.IsClosed() {
 			return io.ErrClosedPipe
 		}
-		// read header first
 		if _, err := io.ReadFull(s.conn, hdr[:]); err == nil {
 			sid := hdr.StreamID()
 			switch hdr.Cmd() {
@@ -271,6 +302,21 @@ func (s *Session) recvLoop() error {
 					} else {
 						buf.Put(buffer)
 						return err
+					}
+					// Track received DATA bytes for WINDOW_UPDATE injection.
+					// recvBytes and wndUpdateTrigger are only accessed here
+					// (recvLoop goroutine), so no lock is needed.
+					if s.wndUpdateTrigger > 0 {
+						s.recvBytes += int(hdr.Length())
+						if s.recvBytes >= s.wndUpdateTrigger {
+							// Reset to 0 rather than subtracting the trigger:
+							// the threshold is re-jittered below, so carrying
+							// a remainder across intervals would bias the
+							// spacing back toward a fixed average.
+							s.recvBytes = 0
+							s.writeWindowUpdateWaste()
+							s.wndUpdateTrigger = nextWndInterval(s.wndUpdateBase)
+						}
 					}
 				}
 			case cmdSYN:
@@ -342,20 +388,29 @@ func (s *Session) recvLoop() error {
 					if !s.isClient {
 						receivedSettingsFromClient = true
 						m := util.StringMapFromBytes(buffer)
-						paddingF := s.padding.Load()
-						if m["padding-md5"] != paddingF.Md5 {
-							f := newFrame(cmdUpdatePaddingScheme, 0)
-							f.data = paddingF.RawScheme
-							_, err = s.writeControlFrame(f)
-							if err != nil {
-								buf.Put(buffer)
-								return err
-							}
+
+						if m["rs"] != "1" {
+							f := newFrame(cmdAlert, 0)
+							f.data = []byte("client does not support record shaper, please upgrade")
+							s.writeControlFrame(f)
+							buf.Put(buffer)
+							return nil
 						}
-						// check client's version
+
+						paddingF := s.padding.Load()
+						needUpdate := m["padding-md5"] != paddingF.Md5
+						needServerSettings := false
 						if v, err := strconv.Atoi(m["v"]); err == nil && v >= 2 {
 							s.peerVersion.Store(uint32(v))
-							// send cmdServerSettings
+							needServerSettings = true
+						}
+
+						// Send cmdServerSettings first — this maps to the
+						// H2 SETTINGS frame that a real Caddy server sends
+						// immediately after the client preface.  The frame
+						// is small (10 B) so padControlFrame shapes it to
+						// an H2-characteristic size (14/17/45/22-30 B).
+						if needServerSettings {
 							f := newFrame(cmdServerSettings, 0)
 							f.data = util.StringMap{
 								"v": "2",
@@ -366,6 +421,31 @@ func (s *Session) recvLoop() error {
 								return err
 							}
 						}
+
+						// Simulate server SETTINGS_ACK: a real Caddy sends
+						// SETTINGS_ACK after receiving the client preface.
+						// Padded to 14-45B by padControlFrame (same limitation
+						// as the client-side SETTINGS_ACK).
+						if _, err = s.writeControlFrame(newFrame(cmdWaste, 0)); err != nil {
+							buf.Put(buffer)
+							return err
+						}
+
+						// Send cmdUpdatePaddingScheme separately — maps
+						// loosely to H2 SETTINGS with extension params.
+						// This only fires on first connect when the client
+						// has a stale padding scheme.
+						if needUpdate {
+							f := newFrame(cmdUpdatePaddingScheme, 0)
+							f.data = paddingF.RawScheme
+							_, err = s.writeControlFrame(f)
+							if err != nil {
+								buf.Put(buffer)
+								return err
+							}
+						}
+
+						s.signalIdleReady()
 					}
 					buf.Put(buffer)
 				}
@@ -394,6 +474,10 @@ func (s *Session) recvLoop() error {
 					if s.isClient {
 						if padding.UpdatePaddingScheme(rawScheme, s.padding) {
 							s.logger.Debug(fmt.Sprintf("[Update padding succeed] %x\n", md5.Sum(rawScheme)))
+							// A pushed scheme may turn idle injection on. idleReady is
+							// already closed here (cmdServerSettings precedes this frame),
+							// so a newly started loop runs at once.
+							s.maybeStartIdleLoop()
 						} else {
 							s.logger.Warn(fmt.Sprintf("[Update padding failed] %x\n", md5.Sum(rawScheme)))
 						}
@@ -413,11 +497,19 @@ func (s *Session) recvLoop() error {
 						return err
 					}
 					if s.isClient {
-						// check server's version
 						m := util.StringMapFromBytes(buffer)
 						if v, err := strconv.Atoi(m["v"]); err == nil {
 							s.peerVersion.Store(uint32(v))
 						}
+						// Simulate client SETTINGS_ACK: a real Go H2 client
+						// sends a SETTINGS_ACK (9B) after receiving the server's
+						// SETTINGS.  We emit a cmdWaste frame via writeControlFrame;
+						// padControlFrame shapes it to an H2-characteristic control
+						// frame size (14/17/22-30/45B).  The exact 9B is not
+						// achievable through padControlFrame (appendWasteFrame adds
+						// a minimum 7B header), but TLS record overhead (22B for
+						// TLS 1.3) dilutes the difference.
+						s.writeControlFrame(newFrame(cmdWaste, 0))
 						s.signalIdleReady()
 					}
 					buf.Put(buffer)
@@ -452,22 +544,57 @@ func (s *Session) streamClosed(sid uint32) error {
 }
 
 func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
-	dataLen := len(data)
+	totalLen := len(data)
+	written := 0
 
-	buffer := buf.NewSize(dataLen + headerOverHeadSize)
-	buffer.WriteByte(cmdPSH)
-	binary.BigEndian.PutUint32(buffer.Extend(4), sid)
-	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
-	buffer.Write(data)
-	_, err := s.writeConn(buffer.Bytes())
-	buffer.Release()
-	if err != nil {
-		s.connBroken.Store(true)
-		return 0, err
+	for len(data) > 0 {
+		chunk := data
+		if len(chunk) > h2MaxFramePayload {
+			chunk = chunk[:h2MaxFramePayload]
+		}
+		chunkLen := len(chunk)
+
+		buffer := buf.NewSize(chunkLen + headerOverHeadSize)
+		buffer.WriteByte(cmdPSH)
+		binary.BigEndian.PutUint32(buffer.Extend(4), sid)
+		binary.BigEndian.PutUint16(buffer.Extend(2), uint16(chunkLen))
+		buffer.Write(chunk)
+
+		// Data-frame writes have NO deadline, matching upstream.
+		// On error mark connBroken so the session won't be reused,
+		// but do NOT Close — let the recvLoop continue draining any
+		// in-flight responses for other streams (upstream behaviour).
+		_, err := s.writeConn(buffer.Bytes(), false)
+		buffer.Release()
+		if err != nil {
+			s.connBroken.Store(true)
+			// Return the payload bytes already flushed, per the
+			// io.Writer contract (n < len(p) with a non-nil error),
+			// so callers' byte accounting and io.Copy totals stay correct.
+			return written, err
+		}
+
+		written += chunkLen
+		data = data[chunkLen:]
 	}
 
-	return dataLen, nil
+	return totalLen, nil
 }
+
+const (
+	// earlyDataFrames is how many leading data frames of each stream are
+	// eligible for split shaping.  The inner TLS handshake (ClientHello,
+	// ChangeCipherSpec/Finished) lives in the first few frames.
+	earlyDataFrames = 4
+	// earlySplitThresh: frames at or below this size are sent as-is.  The
+	// target-address frame and tiny handshake records carry no
+	// distinctive single-record signature, so splitting them only adds
+	// overhead.
+	earlySplitThresh = 256
+	// earlySplitMin is the minimum size of each piece produced by a split,
+	// so the resulting records stay plausibly H2-DATA-sized.
+	earlySplitMin = 48
+)
 
 // maxPaddingSchemeLen bounds an incoming cmdUpdatePaddingScheme payload.
 // The frame length field is uint16 (so <=64 KB already), but a server the
@@ -475,106 +602,264 @@ func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
 // above any legitimate scheme (the built-in default is ~120 B).
 const maxPaddingSchemeLen = 16 * 1024
 
+// writeDataFrameShaped routes an early, mid-sized data frame through the
+// splitter and everything else through the normal (16 KB-chunking) path.
+//
+// The split path is deliberately confined to the (earlySplitThresh,
+// h2MaxFramePayload] range:
+//   - At or below earlySplitThresh there is nothing worth splitting.
+//   - Above h2MaxFramePayload, writeDataFrame already chunks the payload
+//     into multiple <=16 KB records, so the "single large record"
+//     signature is absent and there is nothing to split.  Routing large
+//     frames here also keeps every cmdPSH chunk well under 65535 bytes,
+//     avoiding the uint16 length-field overflow (and the consequent
+//     receiver desync) that splitting an oversized chunk would cause, and
+//     preserves the 16 KB-per-record H2 mimicry maintained everywhere else.
+func (s *Session) writeDataFrameShaped(sid uint32, data []byte, early bool) (int, error) {
+	if !early || len(data) <= earlySplitThresh || len(data) > h2MaxFramePayload {
+		return s.writeDataFrame(sid, data)
+	}
+	return s.writeDataFrameSplit(sid, data)
+}
+
+// writeDataFrameSplit splits data into 2-3 random-sized cmdPSH frames and
+// writes them back-to-back with no buffering and no delay.  The split is
+// transparent to the inner TLS stream (the peer reassembles the byte
+// stream) and uses the no-deadline data path so weak links are not killed.
+//
+// Precondition (guaranteed by writeDataFrameShaped): earlySplitThresh <
+// len(data) <= h2MaxFramePayload, so every chunk is < 16384 < 65535 and the
+// uint16 length field never overflows.
+func (s *Session) writeDataFrameSplit(sid uint32, data []byte) (int, error) {
+	total := len(data)
+	parts := 2
+	if total > 600 {
+		parts = 3
+	}
+	offset := 0
+	written := 0
+	for i := 0; i < parts; i++ {
+		var chunk []byte
+		if i == parts-1 {
+			chunk = data[offset:]
+		} else {
+			remaining := total - offset
+			partsLeft := parts - i
+			// Reserve at least earlySplitMin for each remaining piece.
+			maxCut := remaining - earlySplitMin*(partsLeft-1)
+			if maxCut <= earlySplitMin {
+				chunk = data[offset:]
+				if err := s.sendPSH(sid, chunk); err != nil {
+					return written, err
+				}
+				return total, nil
+			}
+			cut := earlySplitMin + util.FastIntn(maxCut-earlySplitMin+1)
+			chunk = data[offset : offset+cut]
+			offset += cut
+		}
+		if err := s.sendPSH(sid, chunk); err != nil {
+			// Return the payload bytes already flushed by earlier
+			// sendPSH calls, per the io.Writer contract.
+			return written, err
+		}
+		written += len(chunk)
+	}
+	return total, nil
+}
+
+// sendPSH builds and writes a single cmdPSH frame on the no-deadline data
+// path.  On error it marks connBroken (matching writeDataFrame) without
+// calling Close, so recvLoop keeps draining in-flight responses for other
+// streams.  Callers must keep len(chunk) <= maxFrameDataLen (enforced by
+// writeDataFrameShaped's h2MaxFramePayload bound).
+func (s *Session) sendPSH(sid uint32, chunk []byte) error {
+	buffer := buf.NewSize(len(chunk) + headerOverHeadSize)
+	buffer.WriteByte(cmdPSH)
+	binary.BigEndian.PutUint32(buffer.Extend(4), sid)
+	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(len(chunk)))
+	buffer.Write(chunk)
+	_, err := s.writeConn(buffer.Bytes(), false)
+	buffer.Release()
+	if err != nil {
+		s.connBroken.Store(true)
+	}
+	return err
+}
+
 func (s *Session) writeControlFrame(frame frame) (int, error) {
 	dataLen := len(frame.data)
 	if dataLen > maxFrameDataLen {
 		return 0, fmt.Errorf("control frame data too large: %d > %d", dataLen, maxFrameDataLen)
 	}
 
-	buffer := buf.NewSize(dataLen + headerOverHeadSize)
+	// Reserve the controlFramePadHint spare only while the frame is small
+	// enough that the shaper could still pad it (WriteControl pads only while
+	// len < maxTarget; WriteInitialFlush only up to HeadersTarget.Max — both
+	// below controlFramePadHint under the default scheme). A frame already at
+	// or above the hint is never padded, so the spare would be dead capacity;
+	// appendWasteFrame still falls back to a fresh allocation for any custom
+	// scheme whose target exceeds the hint, so the wire output is unchanged.
+	padHint := controlFramePadHint
+	if dataLen+headerOverHeadSize >= controlFramePadHint {
+		padHint = 0
+	}
+	buffer := buf.NewSize(dataLen + headerOverHeadSize + padHint)
 	buffer.WriteByte(frame.cmd)
 	binary.BigEndian.PutUint32(buffer.Extend(4), frame.sid)
 	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
 	buffer.Write(frame.data)
 
-	s.conn.SetWriteDeadline(time.Now().Add(time.Second * 5))
-
-	_, err := s.writeConn(buffer.Bytes())
+	// Control-frame writes use a 5 s deadline (via WriteControl)
+	// and Close the session on failure, matching upstream.
+	_, err := s.writeConn(buffer.Bytes(), true)
 	buffer.Release()
 	if err != nil {
 		s.Close()
 		return 0, err
 	}
 
-	s.conn.SetWriteDeadline(time.Time{})
-
 	return dataLen, nil
 }
 
-func (s *Session) writeConn(b []byte) (n int, err error) {
+// writeConn handles buffer management.  When isCtrl is true the final
+// write uses shaper.WriteControl (5 s deadline + padding); when false
+// it uses shaper.WriteData (no deadline, no padding).
+//
+// A buffer flush uses WriteInitialFlush which pads the combined blob
+// (cmdSettings + cmdSYN + cmdPSH) to an H2 HEADERS-like target size,
+// reproducing the TLS record pattern of a Go stdlib H2 client.
+func (s *Session) writeConn(b []byte, isCtrl bool) (n int, err error) {
 	s.connLock.Lock()
 	defer s.connLock.Unlock()
 
-	if s.buffering {
-		s.buffer = slices.Concat(s.buffer, b)
-		return len(b), nil
-	} else if len(s.buffer) > 0 {
-		b = slices.Concat(s.buffer, b)
-		s.buffer = nil
+	if s.IsClosed() {
+		return 0, io.ErrClosedPipe
 	}
 
-	// calulate & send padding
-	if s.sendPadding {
-		pkt := s.pktCounter.Add(1)
-		paddingF := s.padding.Load()
-		if pkt < paddingF.Stop {
-			pktSizes := paddingF.GenerateRecordPayloadSizes(pkt)
-			for _, l := range pktSizes {
-				remainPayloadLen := len(b)
-				if l == padding.CheckMark {
-					if remainPayloadLen == 0 {
-						break
-					} else {
-						continue
-					}
-				}
-				if remainPayloadLen > l { // this packet is all payload
-					_, err = s.conn.Write(b[:l])
-					if err != nil {
-						return 0, err
-					}
-					n += l
-					b = b[l:]
-				} else if remainPayloadLen > 0 { // this packet contains padding and the last part of payload
-					paddingLen := l - remainPayloadLen - headerOverHeadSize
-					if paddingLen > 0 {
-						padding := make([]byte, headerOverHeadSize+paddingLen)
-						padding[0] = cmdWaste
-						binary.BigEndian.PutUint32(padding[1:5], 0)
-						binary.BigEndian.PutUint16(padding[5:7], uint16(paddingLen))
-						b = slices.Concat(b, padding)
-					}
-					_, err = s.conn.Write(b)
-					if err != nil {
-						return 0, err
-					}
-					n += remainPayloadLen
-					b = nil
-				} else { // this packet is all padding
-					padding := make([]byte, headerOverHeadSize+l)
-					padding[0] = cmdWaste
-					binary.BigEndian.PutUint32(padding[1:5], 0)
-					binary.BigEndian.PutUint16(padding[5:7], uint16(l))
-					_, err = s.conn.Write(padding)
-					if err != nil {
-						return 0, err
-					}
-					b = nil
-				}
-			}
-			// maybe still remain payload to write
-			if len(b) == 0 {
+	if s.buffering {
+		s.buffer = append(s.buffer, b...)
+		return len(b), nil
+	}
+	if len(s.buffer) > 0 {
+		// Flush: prepend buffer contents.  Shape the combined blob to
+		// look like an H2 HEADERS frame — the first client-to-server
+		// TLS record after the connection preface in a real Go H2 session.
+		b = append(s.buffer, b...)
+		s.buffer = nil
+		return s.shaper.WriteInitialFlush(b)
+	}
+
+	// On a reused (pooled) session the SYN that opens a new stream is a
+	// fresh request, which in a real Go H2 client is a HEADERS frame
+	// (90-140 B), not a 14-45 B control frame.  Route the standalone SYN
+	// through WriteInitialFlush so it is shaped to headers_target with a
+	// 5 s deadline, matching the first stream's SYN.  The first stream's SYN
+	// is buffered (s.buffering) and flushed via the branch above, so it never
+	// reaches here; the two paths therefore agree.
+	if isCtrl && len(b) > 0 && b[0] == cmdSYN {
+		return s.shaper.WriteInitialFlush(b)
+	}
+
+	if isCtrl {
+		return s.shaper.WriteControl(b)
+	}
+	return s.shaper.WriteData(b)
+}
+
+// maybeStartIdleLoop spawns idleLoop once, iff idle injection is enabled by
+// the current padding scheme. The decision reads the live padding factory
+// (an atomic load of an immutable value) rather than the shaper's lazily
+// refreshed cache, so it is correct immediately after a server-pushed scheme
+// is applied and needs no connLock — keeping it safe to call from recvLoop
+// without ever blocking the read path. idleLoopOnce makes repeated calls
+// (Run + each scheme update) a no-op once started.
+func (s *Session) maybeStartIdleLoop() {
+	cfg := s.padding.Load().RecordConfig
+	if len(cfg.IdleSizes) == 0 || cfg.IdleIntervalMs[1] <= 0 {
+		return
+	}
+	s.idleLoopOnce.Do(func() { go s.idleLoop() })
+}
+
+func (s *Session) idleLoop() {
+	select {
+	case <-s.die:
+		return
+	case <-s.idleReady:
+	}
+
+	s.connLock.Lock()
+	// Sync the shaper's cached config to the current (possibly just-pushed)
+	// scheme before deciding whether to run; otherwise the stale default
+	// (idle off) would make this loop exit immediately even though a pushed
+	// scheme enabled injection. Subsequent IdleInterval/BuildIdleFrame reads
+	// then see the fresh config (BuildIdleFrame also refreshes on its own).
+	s.shaper.maybeRefreshConfig()
+	enabled := s.shaper.IdleEnabled()
+	s.connLock.Unlock()
+	if !enabled {
+		return
+	}
+
+	for {
+		s.connLock.Lock()
+		interval := s.shaper.IdleInterval()
+		s.connLock.Unlock()
+
+		select {
+		case <-s.die:
+			return
+		case <-time.After(interval):
+			select {
+			case <-s.die:
 				return
-			} else {
-				n2, err := s.conn.Write(b)
-				return n + n2, err
+			default:
 			}
-		} else {
-			s.sendPadding = false
+
+			s.connLock.Lock()
+			if s.IsClosed() || s.connBroken.Load() {
+				s.connLock.Unlock()
+				if s.connBroken.Load() && !s.IsClosed() {
+					s.Close()
+				}
+				return
+			}
+			if s.buffering {
+				s.connLock.Unlock()
+				continue
+			}
+			frame := s.shaper.BuildIdleFrame()
+			if frame == nil {
+				s.connLock.Unlock()
+				continue
+			}
+			s.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+			_, err := s.conn.Write(frame)
+			s.conn.SetWriteDeadline(time.Time{})
+			if err == nil {
+				s.shaper.LastWrite = time.Now()
+			}
+			s.connLock.Unlock()
+
+			if err != nil {
+				s.connBroken.Store(true)
+				s.Close()
+				return
+			}
 		}
 	}
+}
 
-	return s.conn.Write(b)
+// nextWndInterval returns base +/- 25 % jitter, modelling the non-rigid
+// point at which Go's H2 flow controller emits a WINDOW_UPDATE rather than
+// a fixed byte count (the fixed interval was a deterministic tool signature).
+func nextWndInterval(base int) int {
+	if base <= 0 {
+		return 0
+	}
+	jitter := base / 4
+	return base - jitter + util.FastIntn(2*jitter+1)
 }
 
 const writeDeadline = 5 * time.Second
@@ -704,4 +989,73 @@ func (s *Session) heartbeatProbe() bool {
 	}
 
 	return true
+}
+
+// writeWindowUpdateWaste emits a 26-byte cmdWaste record modelling the
+// stream-level + connection-level WINDOW_UPDATE pair that a real Go H2
+// client writes back-to-back (two 13 B frames = 7 B anytls header + 6 B
+// payload each, the wire size of an H2 WINDOW_UPDATE).
+//
+// It is called from recvLoop.  anytls has no real flow control, so this is
+// a pure mimicry frame: skipping it has zero functional effect.  It
+// therefore uses TryLock and bails if the connLock is held -- a data write
+// is in progress on the no-deadline path, and blocking here would stall
+// recvLoop (and thus all reads).  Skipping the cosmetic frame is strictly
+// safer than blocking, at the cost of slightly weaker H2 mimicry during
+// simultaneous heavy upload + download.
+func (s *Session) writeWindowUpdateWaste() {
+	if s.IsClosed() || s.connBroken.Load() {
+		return
+	}
+	if !s.connLock.TryLock() {
+		return
+	}
+	defer s.connLock.Unlock()
+	if s.IsClosed() || s.connBroken.Load() {
+		return
+	}
+
+	var frame [26]byte
+	frame[0] = cmdWaste
+	binary.BigEndian.PutUint16(frame[5:7], 6)
+	util.FillRandom(frame[7:13])
+	frame[13] = cmdWaste
+	binary.BigEndian.PutUint16(frame[18:20], 6)
+	util.FillRandom(frame[20:26])
+
+	// This is a purely cosmetic camouflage frame, so the write is
+	// best-effort: use a SHORT (1 s) deadline and on a clean failure
+	// (nothing written, e.g. a transiently full uplink) simply return
+	// without storing connBroken or tearing the session down — that would
+	// otherwise (a) stall recvLoop for the full deadline and (b) falsely
+	// mark the session broken; a genuinely dead conn is still detected by
+	// the read path.  A PARTIAL write (n > 0) does corrupt frame framing,
+	// so in that case the session must be torn down.  The deadline is
+	// always reset so it never leaks onto a later non-cosmetic write.
+	s.conn.SetWriteDeadline(time.Now().Add(time.Second))
+	n, err := s.conn.Write(frame[:])
+	s.conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		if n > 0 {
+			s.connBroken.Store(true)
+		}
+		return
+	}
+	s.shaper.LastWrite = time.Now()
+}
+
+// writeFrameBytes writes a single anytls frame directly to the conn.
+// Used only in Close() for the GOAWAY simulation where we need a raw
+// write without shaping.  The caller must hold connLock.
+func writeFrameBytes(conn net.Conn, cmd byte, sid uint32, randomPayloadLen int) {
+	b := make([]byte, headerOverHeadSize+randomPayloadLen)
+	b[0] = cmd
+	binary.BigEndian.PutUint32(b[1:5], sid)
+	binary.BigEndian.PutUint16(b[5:7], uint16(randomPayloadLen))
+	if randomPayloadLen > 0 {
+		util.FillRandom(b[headerOverHeadSize:])
+	}
+	conn.SetWriteDeadline(time.Now().Add(time.Second))
+	conn.Write(b) // best-effort, error ignored
+	conn.SetWriteDeadline(time.Time{})
 }

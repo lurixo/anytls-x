@@ -71,13 +71,11 @@ func (c *Client) createOutboundConnection(ctx context.Context) (net.Conn, error)
 	defer b.Release()
 
 	b.Write(c.passwordSha256)
-	var paddingLen int
-	if pad := c.padding.Load().GenerateRecordPayloadSizes(0); len(pad) > 0 {
-		paddingLen = pad[0]
-	}
+	paddingLen := c.padding.Load().SamplePaddingLen()
 	binary.BigEndian.PutUint16(b.Extend(2), uint16(paddingLen))
 	if paddingLen > 0 {
-		b.WriteZeroN(paddingLen)
+		// Fill in place via b.Extend to avoid a temporary alloc + copy.
+		util.FillRandom(b.Extend(paddingLen))
 	}
 
 	_, err = b.WriteTo(conn)
