@@ -17,6 +17,13 @@ const ( // cmds
 	cmdHeartRequest   = 8  // Keep alive command
 	cmdHeartResponse  = 9  // Keep alive command
 	cmdServerSettings = 10 // Settings (Server send to client)
+	// Rail-switch / 0-RTT downlink migration ("换轨"). Only ever sent when
+	// migration is negotiated active (ANYTLS_MIGRATION=1 on both peers); a
+	// default build neither sends nor expects these.
+	cmdMigrateReady   = 11 // Server -> client: inner TLS handshake done; data = 16-byte carrier token
+	cmdMigrateGo      = 12 // Server -> client: downlink barrier — last mux downlink frame for this sid
+	cmdMigrateCarrier = 13 // Client -> server: first frame on the dedicated carrier B; data = token
+	cmdUplinkFin      = 14 // Client -> server: uplink barrier — last mux uplink frame for this sid
 )
 
 const (

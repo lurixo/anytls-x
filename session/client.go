@@ -46,8 +46,16 @@ type Client struct {
 	heartbeatQuietWindow time.Duration
 	heartbeatTimeout     time.Duration
 
+	// migEnabled turns on the 0-RTT rail-switch for sessions created by this
+	// client (the config option ORed with the env default by anytls.NewClient).
+	migEnabled bool
+
 	logger logger.Logger
 }
+
+// SetMigrationEnabled enables or disables the 0-RTT rail-switch for sessions
+// subsequently created by this client. Called once at construction.
+func (c *Client) SetMigrationEnabled(enabled bool) { c.migEnabled = enabled }
 
 func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
 	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout time.Duration, minIdleSession int, maxSession int,
@@ -280,6 +288,7 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 
 	session := NewClientSession(underlying, c.padding, c.logger)
 	session.client = c
+	session.migActive = c.migEnabled
 	session.seq = c.sessionCounter.Add(1)
 	session.dieHook = func() {
 		c.idleSessionLock.Lock()

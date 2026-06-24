@@ -38,6 +38,11 @@ type Stream struct {
 	// Fires if the server does not acknowledge the stream within the deadline.
 	// Only closes this stream; may also close session if no SYNACK received.
 	synTimer *time.Timer
+
+	// mig holds 0-RTT rail-switch state; non-nil only while migration is
+	// negotiated active on the session. A nil mig means every path below
+	// behaves exactly like upstream.
+	mig *streamMig
 }
 
 func newStream(id uint32, sess *Session) *Stream {
@@ -46,6 +51,9 @@ func newStream(id uint32, sess *Session) *Stream {
 	s.sess = sess
 	s.pipeR, s.pipeW = pipe.Pipe()
 	s.writeDeadline = pipe.MakePipeDeadline()
+	if sess.migActive {
+		s.mig = newStreamMig(s, sess)
+	}
 	return s
 }
 
@@ -55,6 +63,11 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 		if ep := s.dieErr.Load(); ep != nil {
 			err = *ep
 		}
+	}
+	if n > 0 && s.mig != nil && !s.sess.isClient {
+		// Server uplink tap: feed the relayed client->server inner records to
+		// the handshake detector. Cheap and stops itself once a verdict is in.
+		s.mig.observeServerRead(b[:n])
 	}
 	return
 }
@@ -68,14 +81,69 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 	if ep := s.dieErr.Load(); ep != nil {
 		return 0, *ep
 	}
+	if sm := s.mig; sm != nil {
+		return s.migWrite(sm, b)
+	}
 	seq := s.frameSeq.Add(1)
 	early := seq <= earlyDataFrames
 	n, err = s.sess.writeDataFrameShaped(s.id, b, early)
 	return
 }
 
+// migWrite is the write path while the rail-switch is active, for both sides.
+// After the cut-over it writes raw bytes straight onto the dedicated carrier B
+// (server downlink, client uplink), serialised under writeMu so concurrent
+// writers never interleave a record. Before the cut-over it writes the mux; on
+// the server it also feeds the handshake detector and fires the cut-over offer
+// once authorised. writeMu serialises against the barrier emitters
+// (serverAttachCarrier / maybeClientCutover) so a barrier lands exactly between
+// the last mux frame and the first B frame for this stream.
+func (s *Stream) migWrite(sm *streamMig, b []byte) (n int, err error) {
+	sm.writeMu.Lock()
+	defer sm.writeMu.Unlock()
+	if bc := sm.bWriteConn; bc != nil {
+		return bc.Write(b)
+	}
+	if !s.sess.isClient {
+		sm.observeServerWrite(b)
+	}
+	seq := s.frameSeq.Add(1)
+	early := seq <= earlyDataFrames
+	n, err = s.sess.writeDataFrameShaped(s.id, b, early)
+	if !s.sess.isClient {
+		sm.serverMaybeTrigger()
+	}
+	return
+}
+
+// BeginMigrationPayload marks the point where the anytls stream header (the
+// destination address) has been fully consumed and the real payload begins, so
+// the server-side migration detector observes only payload bytes — never the
+// header (whose leading address-family byte would otherwise be misread as a TLS
+// record type). The server's stream acceptor calls this once, right after
+// reading the destination. No-op when migration is inactive for this stream.
+func (s *Stream) BeginMigrationPayload() {
+	if s.mig != nil {
+		s.mig.payloadStarted.Store(true)
+	}
+}
+
 func (s *Stream) Close() error {
 	return s.closeWithError(io.ErrClosedPipe)
+}
+
+// CloseWrite implements N.WriteCloser. With the rail-switch active and the flow
+// already cut over to carrier B, it half-closes B's write direction so the
+// migrated byte stream is flushed and ended losslessly (see streamMig.closeWrite)
+// instead of being abruptly reset. For every other case — migration inactive
+// (s.mig == nil) or a flow that never cut over — it falls back to the full Close
+// the sing-box relay would otherwise have called, so the non-migration path is
+// byte-for-byte unchanged.
+func (s *Stream) CloseWrite() error {
+	if s.mig == nil {
+		return s.Close()
+	}
+	return s.mig.closeWrite()
 }
 
 // closeLocally only closes Stream and don't notify remote peer
@@ -88,6 +156,9 @@ func (s *Stream) closeLocally() {
 		e := error(net.ErrClosed)
 		s.dieErr.Store(&e)
 		s.pipeR.Close()
+		if s.mig != nil {
+			s.mig.closeOnStreamEnd()
+		}
 		once = true
 	})
 	if once {
@@ -106,6 +177,9 @@ func (s *Stream) closeWithError(err error) error {
 		}
 		s.dieErr.Store(&err)
 		s.pipeR.Close()
+		if s.mig != nil {
+			s.mig.closeOnStreamEnd()
+		}
 		once = true
 	})
 	if once {

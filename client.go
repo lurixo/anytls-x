@@ -25,8 +25,11 @@ type ClientConfig struct {
 	HeartbeatInterval        time.Duration
 	HeartbeatQuietWindow     time.Duration
 	HeartbeatTimeout         time.Duration
-	DialOut                  util.DialOutFunc
-	Logger                   logger.ContextLogger
+	// EnableMigration turns on the 0-RTT rail-switch (config option); it is
+	// ORed with the ANYTLS_MIGRATION env default.
+	EnableMigration bool
+	DialOut         util.DialOutFunc
+	Logger          logger.ContextLogger
 }
 
 type Client struct {
@@ -45,6 +48,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	// Initialize the padding state of this client
 	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &c.padding)
 	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MinIdleSession, config.MaxSession, config.HeartbeatInterval, config.HeartbeatQuietWindow, config.HeartbeatTimeout)
+	c.sessionClient.SetMigrationEnabled(config.EnableMigration || session.MigrationEnvDefault())
 	return c, nil
 }
 

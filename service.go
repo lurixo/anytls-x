@@ -26,6 +26,14 @@ type Service struct {
 	handler         N.TCPConnectionHandlerEx
 	fallbackHandler N.TCPConnectionHandlerEx
 	logger          logger.ContextLogger
+	// migReg matches inbound rail-switch carriers (carrier B) back to the
+	// server stream awaiting them. Non-nil only when migration is enabled.
+	migReg *session.MigRegistry
+	// migMinBulk is the per-service bulk-gate override handed to each server
+	// session (0 = use the built-in default).
+	migMinBulk int
+	// migTLSOnly restricts migration to TLS flows (opaque flows stay on the mux).
+	migTLSOnly bool
 }
 
 type ServiceConfig struct {
@@ -34,6 +42,15 @@ type ServiceConfig struct {
 	Handler         N.TCPConnectionHandlerEx
 	FallbackHandler N.TCPConnectionHandlerEx
 	Logger          logger.ContextLogger
+	// EnableMigration turns on inbound 0-RTT rail-switch handling (config
+	// option); it is ORed with the ANYTLS_MIGRATION env default.
+	EnableMigration bool
+	// MigrationMinBulkBytes overrides the post-handshake bulk gate that decides
+	// when a flow is migrated (0 = built-in default; clamped to a sane floor).
+	MigrationMinBulkBytes int
+	// MigrationTLSOnly restricts migration to TLS flows; opaque flows (UoT-UDP,
+	// plaintext …) then stay on the mux.
+	MigrationTLSOnly bool
 }
 
 type User struct {
@@ -56,6 +73,12 @@ func NewService(config ServiceConfig) (*Service, error) {
 
 	if !padding.UpdatePaddingScheme(config.PaddingScheme, &service.padding) {
 		return nil, errors.New("incorrect padding scheme format")
+	}
+
+	if config.EnableMigration || session.MigrationEnvDefault() {
+		service.migReg = session.NewMigRegistry()
+		service.migMinBulk = config.MigrationMinBulkBytes
+		service.migTLSOnly = config.MigrationTLSOnly
 	}
 
 	return service, nil
@@ -115,17 +138,38 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 		}
 	}
 
-	session := session.NewServerSession(conn, func(stream *session.Stream) {
+	// Rail-switch: an authenticated inbound whose first frame is a
+	// cmdMigrateCarrier is a dedicated carrier B for an already-running
+	// stream, not a new session. MaybeAcceptCarrier consumes it (handled) or
+	// rewinds the frame header and returns conn for normal session handling.
+	if s.migReg != nil {
+		var handled bool
+		conn, handled, err = session.MaybeAcceptCarrier(conn, s.migReg)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
+	}
+
+	serverSession := session.NewServerSession(conn, func(stream *session.Stream) {
 		destination, err := M.SocksaddrSerializer.ReadAddrPort(stream)
 		if err != nil {
 			s.logger.ErrorContext(ctx, "ReadAddrPort:", err)
 			return
 		}
+		// The destination header is now consumed; the rail-switch detector must
+		// observe only the inner payload from here on.
+		stream.BeginMigrationPayload()
 
 		s.handler.NewConnectionEx(ctx, stream, source, destination, onClose)
 	}, &s.padding, s.logger)
-	session.Run()
-	session.Close()
+	serverSession.SetMigRegistry(s.migReg)
+	serverSession.SetMigMinBulk(s.migMinBulk)
+	serverSession.SetMigTLSOnly(s.migTLSOnly)
+	serverSession.Run()
+	serverSession.Close()
 	return nil
 }
 

@@ -80,6 +80,40 @@ type Session struct {
 
 	// server
 	onNewStream func(stream *Stream)
+
+	// migActive is set once, before any stream is created, when the 0-RTT
+	// rail-switch is negotiated active for this session (ANYTLS_MIGRATION=1 on
+	// the client, which advertises "mig"=1, and on the server). When false the
+	// session behaves exactly like upstream. Streams attach their migration
+	// state (Stream.mig) at creation iff this is true.
+	migActive bool
+	// migRegistry (server only) lets a stream register its pending carrier
+	// token so the Service can match an inbound carrier B back to it.
+	migRegistry *MigRegistry
+	// migMinBulk (server only) is the per-service bulk gate override (0 = use
+	// the built-in default); it is handed to each stream's handshake detector.
+	migMinBulk int
+	// migTLSOnly (server only) restricts migration to TLS flows: opaque flows
+	// (UoT-UDP, plaintext …) then stay on the mux instead of bulk-migrating.
+	migTLSOnly bool
+}
+
+// SetMigRegistry attaches the Service-wide carrier registry to a server
+// session. Called once, before Run, only when migration is enabled.
+func (s *Session) SetMigRegistry(reg *MigRegistry) {
+	s.migRegistry = reg
+}
+
+// SetMigMinBulk sets the per-service bulk-gate override for this server
+// session's streams. Called once, before Run.
+func (s *Session) SetMigMinBulk(n int) {
+	s.migMinBulk = n
+}
+
+// SetMigTLSOnly restricts this server session's migration to TLS flows. Called
+// once, before Run.
+func (s *Session) SetMigTLSOnly(v bool) {
+	s.migTLSOnly = v
 }
 
 func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger) *Session {
@@ -131,6 +165,11 @@ func (s *Session) Run() {
 		"client":      util.Verison,
 		"padding-md5": s.padding.Load().Md5,
 		"rs":          "1",
+	}
+	if s.migActive {
+		// Advertise rail-switch support; the server only drives migration when
+		// it both sees this flag and is itself enabled.
+		settings["mig"] = "1"
 	}
 	f := newFrame(cmdSettings, 0)
 	f.data = settings.ToBytes()
@@ -397,6 +436,15 @@ func (s *Session) recvLoop() error {
 							return nil
 						}
 
+						// Activate the rail-switch for this session only when both
+						// peers support it: the client advertised "mig" and this
+						// server has migration enabled (signalled by a non-nil
+						// registry). Set before any cmdSYN (which follows
+						// cmdSettings on the wire), so server streams see it at birth.
+						if s.migRegistry != nil && m["mig"] == "1" {
+							s.migActive = true
+						}
+
 						paddingF := s.padding.Load()
 						needUpdate := m["padding-md5"] != paddingF.Md5
 						needServerSettings := false
@@ -513,6 +561,68 @@ func (s *Session) recvLoop() error {
 						s.signalIdleReady()
 					}
 					buf.Put(buffer)
+				}
+			case cmdMigrateReady:
+				// Server -> client: the inner TLS handshake is complete; open a
+				// dedicated carrier B and present this token (16-byte payload).
+				// Payload is always drained so the stream stays in sync.
+				if hdr.Length() > 0 {
+					buffer := buf.Get(int(hdr.Length()))
+					if _, err := io.ReadFull(s.conn, buffer); err != nil {
+						buf.Put(buffer)
+						return err
+					}
+					if s.isClient && hdr.Length() >= migTokenLen {
+						var tok migToken
+						copy(tok[:], buffer[:migTokenLen])
+						s.streamLock.RLock()
+						stream, ok := s.streams[sid]
+						s.streamLock.RUnlock()
+						if ok && stream.mig != nil {
+							go stream.mig.clientStartCarrier(tok)
+						}
+					}
+					buf.Put(buffer)
+				}
+			case cmdMigrateGo:
+				// Server -> client downlink barrier (ordering: see carrierToPipe).
+				// Carries no payload; drain any unexpected bytes and tolerate a
+				// wrong-direction frame so a malformed frame can never desync the mux.
+				if hdr.Length() > 0 {
+					buffer := buf.Get(int(hdr.Length()))
+					if _, err := io.ReadFull(s.conn, buffer); err != nil {
+						buf.Put(buffer)
+						return err
+					}
+					buf.Put(buffer)
+				}
+				if s.isClient {
+					s.streamLock.RLock()
+					stream, ok := s.streams[sid]
+					s.streamLock.RUnlock()
+					if ok && stream.mig != nil {
+						stream.mig.clientOnMigrateGo()
+					}
+				}
+			case cmdUplinkFin:
+				// Client -> server uplink barrier (ordering: see carrierToPipe).
+				// Carries no payload; drain any unexpected bytes and tolerate a
+				// wrong-direction frame so a malformed frame can never desync the mux.
+				if hdr.Length() > 0 {
+					buffer := buf.Get(int(hdr.Length()))
+					if _, err := io.ReadFull(s.conn, buffer); err != nil {
+						buf.Put(buffer)
+						return err
+					}
+					buf.Put(buffer)
+				}
+				if !s.isClient {
+					s.streamLock.RLock()
+					stream, ok := s.streams[sid]
+					s.streamLock.RUnlock()
+					if ok && stream.mig != nil {
+						stream.mig.serverOnUplinkFin()
+					}
 				}
 			default:
 				// Drain unknown command's payload to keep the stream
