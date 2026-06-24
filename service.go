@@ -42,15 +42,16 @@ type ServiceConfig struct {
 	Handler         N.TCPConnectionHandlerEx
 	FallbackHandler N.TCPConnectionHandlerEx
 	Logger          logger.ContextLogger
-	// EnableMigration turns on inbound 0-RTT rail-switch handling (config
-	// option); it is ORed with the ANYTLS_MIGRATION env default.
-	EnableMigration bool
+	// EnableMigration controls inbound 0-RTT rail-switch handling. nil enables it
+	// (the default); set a non-nil false to opt out. ORed with ANYTLS_MIGRATION.
+	EnableMigration *bool
 	// MigrationMinBulkBytes overrides the post-handshake bulk gate that decides
-	// when a flow is migrated (0 = built-in default; clamped to a sane floor).
+	// when a flow is migrated (0 = built-in default 65536; clamped to a sane floor).
 	MigrationMinBulkBytes int
 	// MigrationTLSOnly restricts migration to TLS flows; opaque flows (UoT-UDP,
-	// plaintext …) then stay on the mux.
-	MigrationTLSOnly bool
+	// plaintext …) then stay on the mux. nil enables the restriction (the
+	// default); set a non-nil false to also migrate opaque flows.
+	MigrationTLSOnly *bool
 }
 
 type User struct {
@@ -75,10 +76,10 @@ func NewService(config ServiceConfig) (*Service, error) {
 		return nil, errors.New("incorrect padding scheme format")
 	}
 
-	if config.EnableMigration || session.MigrationEnvDefault() {
+	if config.EnableMigration == nil || *config.EnableMigration || session.MigrationEnvDefault() {
 		service.migReg = session.NewMigRegistry()
 		service.migMinBulk = config.MigrationMinBulkBytes
-		service.migTLSOnly = config.MigrationTLSOnly
+		service.migTLSOnly = config.MigrationTLSOnly == nil || *config.MigrationTLSOnly
 	}
 
 	return service, nil

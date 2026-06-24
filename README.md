@@ -13,9 +13,8 @@ capabilities into the source — **session resilience**, **TLS record-level traf
 > replaces the upstream padding system on the wire and is **always on**: the client advertises `rs=1`
 > in its settings and an `anytls-x` server rejects a client that does not with `cmdAlert`
 > (`client does not support record shaper, please upgrade`). Run `anytls-x` on **both** ends. The
-> AnyTLS framing is otherwise unchanged, and the [migration](#0-rtt-rail-switch-migration) feature is
-> **opt-in and off by default**, so a default build is byte-for-byte unchanged on the wire apart from
-> the shaper.
+> AnyTLS framing is otherwise unchanged. The [migration](#0-rtt-rail-switch-migration) rail-switch is
+> **on by default** (TLS flows only); set `migration: false` to keep everything on the multiplex.
 
 ---
 
@@ -35,7 +34,7 @@ The stock `anytls` type continues to track unmodified upstream `sing-anytls`, so
 | `heartbeat_interval` | duration | `15s` | Idle liveness-probe cadence (±25 % jitter); also the application-layer keepalive period. See [Idle session heartbeat](#idle-session-heartbeat). |
 | `heartbeat_quiet_window` | duration | `10s` | Skip the probe if a `cmdHeartResponse` arrived within this window; must be `< heartbeat_interval`. |
 | `heartbeat_timeout` | duration | `5s` | How long to wait for the reply after a probe before declaring the session dead. |
-| `migration` | bool | `false` | Enables the [0-RTT rail-switch](#0-rtt-rail-switch-migration) for this endpoint. Must be set on **both** ends; ORed with the `ANYTLS_MIGRATION=1` environment variable. |
+| `migration` | bool | `true` | The [0-RTT rail-switch](#0-rtt-rail-switch-migration) for this endpoint, **on by default**. Set `false` to disable; `ANYTLS_MIGRATION=1` forces it on regardless. |
 
 ```json
 {
@@ -58,9 +57,9 @@ The stock `anytls` type continues to track unmodified upstream `sing-anytls`, so
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `padding_scheme` | []string | built-in | Record-shaper scheme, one key per element. See [padding_scheme configuration](#padding_scheme-configuration). |
-| `migration` | bool | `false` | Enables the rail-switch for this endpoint (must also be set on the client). |
+| `migration` | bool | `true` | The rail-switch for this endpoint, **on by default**. Set `false` to disable. |
 | `migration_min_bulk_bytes` | int | `0` (→ `65536`) | Post-handshake byte threshold a flow must cross before it migrates. `0` uses the built-in `65536` (64 KB); a non-zero value below the `2048`-byte floor is clamped up to it. |
-| `migration_tls_only` | bool | `false` | When `true`, only TLS flows migrate; opaque flows (UoT-UDP, plaintext, …) stay on the shaped multiplex — a non-TLS bulk flow on the dedicated connection is not record-shaped and would expose its inner datagram sizing. |
+| `migration_tls_only` | bool | `true` | **On by default** — only TLS flows migrate; opaque flows (UoT-UDP, plaintext, …) stay on the shaped multiplex (a non-TLS bulk flow on the dedicated connection is not record-shaped and would expose its inner datagram sizing). Set `false` to also migrate opaque flows. |
 
 ```json
 {
@@ -76,7 +75,7 @@ The stock `anytls` type continues to track unmodified upstream `sing-anytls`, so
   ],
   "migration": true,
   "migration_min_bulk_bytes": 65536,
-  "migration_tls_only": false,
+  "migration_tls_only": true,
   "tls": { "enabled": true, "certificate_path": "fullchain.pem", "key_path": "privkey.pem" }
 }
 ```
@@ -298,10 +297,11 @@ avoids active transfers.
 
 ## 0-RTT rail-switch migration
 
-The 0-RTT rail-switch ("migration") backing the [`migration` option](#sing-box-configuration). **Opt-in,
-off by default** — with neither the option nor `ANYTLS_MIGRATION=1` set, the wire output and code paths
-are byte-for-byte unchanged. Touches `session/migration.go`, `session/migration_detect.go`, and the
-integration in `session/{frame,session,stream,client}.go`, `client.go`, `service.go`.
+The 0-RTT rail-switch ("migration") backing the [`migration` option](#sing-box-configuration). **On by
+default** (restricted to TLS flows by the default-on `migration_tls_only`); set `migration: false` to
+disable, in which case the wire output and code paths are byte-for-byte unchanged. Touches
+`session/migration.go`, `session/migration_detect.go`, and the integration in
+`session/{frame,session,stream,client}.go`, `client.go`, `service.go`.
 
 Every flow still starts on the established, traffic-shaped multiplex (0-RTT) and, for a TLS flow, runs
 its **entire inner TLS handshake there**. Only once the handshake is past and a bulk threshold is crossed

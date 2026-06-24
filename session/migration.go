@@ -31,16 +31,16 @@ import (
 //
 // Everything is fail-safe: a dial failure, an unknown/expired token, a closed
 // stream, or any unrecognised flow simply leaves the traffic on the mux — the
-// original, always-correct path. Enabled per outbound/inbound (EnableMigration,
-// ORed with the ANYTLS_MIGRATION env default) and negotiated via a settings
-// flag; when off, the wire output and code paths are byte-for-byte unchanged.
+// original, always-correct path. On by default (disable per outbound/inbound via
+// a non-nil false EnableMigration; ANYTLS_MIGRATION=1 forces on) and negotiated
+// via a settings flag; when disabled, wire output and code paths are unchanged.
 // ---------------------------------------------------------------------------
 
-// migrationEnvDefault is the package-level default, read once at load from the
-// ANYTLS_MIGRATION env var. The per-outbound / per-inbound config option ORs
-// with it (anytlsx.ClientConfig/ServiceConfig.EnableMigration), so migration can
-// be enabled by config, by env, or both. When neither is set the default build
-// behaves identically to upstream.
+// migrationEnvDefault is the package-level ANYTLS_MIGRATION env override, read
+// once at load. The 0-RTT rail-switch is ON by default (EnableMigration nil); it
+// is disabled only by an explicit non-nil false on the per-outbound / per-inbound
+// config option (anytlsx.ClientConfig/ServiceConfig.EnableMigration), and
+// ANYTLS_MIGRATION=1 forces it on regardless.
 var migrationEnvDefault = os.Getenv("ANYTLS_MIGRATION") == "1"
 
 // MigrationEnvDefault reports the ANYTLS_MIGRATION env default.
