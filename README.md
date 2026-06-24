@@ -9,12 +9,19 @@ capabilities into the source — **session resilience**, **TLS record-level traf
 - **Package:** `anytlsx`
 - **Upstream baseline:** [anytls/sing-anytls](https://github.com/anytls/sing-anytls) `v0.0.11` (verbatim), with the three capabilities applied on top.
 
-> **⚠️ Breaking change — not drop-in with stock `anytls-go`.** The [record shaper](#record-shaper)
-> replaces the upstream padding system on the wire and is **always on**: the client advertises `rs=1`
-> in its settings and an `anytls-x` server rejects a client that does not with `cmdAlert`
-> (`client does not support record shaper, please upgrade`). Run `anytls-x` on **both** ends. The
-> AnyTLS framing is otherwise unchanged. The [migration](#0-rtt-rail-switch-migration) rail-switch is
-> **on by default** (TLS flows only); set `migration: false` to keep everything on the multiplex.
+> **⚠️ Hard fork — not interoperable with stock `anytls` in either direction.** `anytls-x` and `anytls`
+> cannot handshake with each other: **both the inbound and the outbound must be `anytls-x`**. This is
+> enforced at two independent layers:
+>
+> 1. **Domain-separated handshake identity** — the password hash is computed over an `anytls-x:` prefix
+>    (`sha256("anytls-x:" + password)`), so a cross-fork auth packet is an *unknown user* and the
+>    connection is rejected at the very first handshake step, before any settings are exchanged.
+> 2. **Record shaper** — always on; the client advertises `rs=1` and the server requires it (`cmdAlert`
+>    + close otherwise), and the client likewise refuses a server that does not advertise `rs=1`. So
+>    even setting the identity aside, the shaper handshake is verified by **both** ends.
+>
+> The AnyTLS framing is otherwise preserved. The [migration](#0-rtt-rail-switch-migration) rail-switch
+> is **on by default** (TLS flows only); set `migration: false` to keep everything on the multiplex.
 
 ---
 

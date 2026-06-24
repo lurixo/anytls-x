@@ -461,7 +461,8 @@ func (s *Session) recvLoop() error {
 						if needServerSettings {
 							f := newFrame(cmdServerSettings, 0)
 							f.data = util.StringMap{
-								"v": "2",
+								"v":  "2",
+								"rs": "1",
 							}.ToBytes()
 							_, err = s.writeControlFrame(f)
 							if err != nil {
@@ -546,6 +547,11 @@ func (s *Session) recvLoop() error {
 					}
 					if s.isClient {
 						m := util.StringMapFromBytes(buffer)
+						if m["rs"] != "1" {
+							buf.Put(buffer)
+							s.logger.Error("[anytls-x] peer did not advertise the record shaper (rs=1); not an anytls-x server, refusing")
+							return fmt.Errorf("anytls-x: peer does not support the record shaper")
+						}
 						if v, err := strconv.Atoi(m["v"]); err == nil {
 							s.peerVersion.Store(uint32(v))
 						}

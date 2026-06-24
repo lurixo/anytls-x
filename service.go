@@ -88,7 +88,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 func buildUserMap(users []User) map[[32]byte]string {
 	u := make(map[[32]byte]string, len(users))
 	for _, user := range users {
-		u[sha256.Sum256([]byte(user.Password))] = user.Name
+		u[sha256.Sum256([]byte(authDomainPrefix+user.Password))] = user.Name
 	}
 	return u
 }

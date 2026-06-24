@@ -16,6 +16,12 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
+// authDomainPrefix domain-separates anytls-x from upstream anytls at the very
+// first handshake step: the password hash is computed over this prefix + the
+// password, so an anytls-x identity never matches an anytls one (and vice
+// versa). Both ends must be anytls-x to handshake.
+const authDomainPrefix = "anytls-x:"
+
 type ClientConfig struct {
 	Password                 string
 	IdleSessionCheckInterval time.Duration
@@ -40,7 +46,7 @@ type Client struct {
 }
 
 func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
-	pw := sha256.Sum256([]byte(config.Password))
+	pw := sha256.Sum256([]byte(authDomainPrefix + config.Password))
 	c := &Client{
 		passwordSha256: pw[:],
 		dialOut:        config.DialOut,
