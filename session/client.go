@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anytls/sing-anytls/padding"
-	"github.com/anytls/sing-anytls/skiplist"
-	"github.com/anytls/sing-anytls/util"
+	"github.com/lurixo/anytls-x/padding"
+	"github.com/lurixo/anytls-x/skiplist"
+	"github.com/lurixo/anytls-x/util"
 	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/logger"
 )
@@ -47,7 +47,7 @@ type Client struct {
 	heartbeatTimeout     time.Duration
 
 	// migEnabled turns on the 0-RTT rail-switch for sessions created by this
-	// client (the config option ORed with the env default by anytls.NewClient).
+	// client (the config option ORed with the env default by anytlsx.NewClient).
 	migEnabled bool
 
 	logger logger.Logger

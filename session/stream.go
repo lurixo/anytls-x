@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/anytls/sing-anytls/pipe"
+	"github.com/lurixo/anytls-x/pipe"
 )
 
 type Stream struct {

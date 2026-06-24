@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/anytls/sing-anytls/util"
+	"github.com/lurixo/anytls-x/util"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	N "github.com/sagernet/sing/common/network"
@@ -38,7 +38,7 @@ import (
 
 // migrationEnvDefault is the package-level default, read once at load from the
 // ANYTLS_MIGRATION env var. The per-outbound / per-inbound config option ORs
-// with it (anytls.ClientConfig/ServiceConfig.EnableMigration), so migration can
+// with it (anytlsx.ClientConfig/ServiceConfig.EnableMigration), so migration can
 // be enabled by config, by env, or both. When neither is set the default build
 // behaves identically to upstream.
 var migrationEnvDefault = os.Getenv("ANYTLS_MIGRATION") == "1"

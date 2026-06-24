@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/anytls/sing-anytls/util"
+	"github.com/lurixo/anytls-x/util"
 	"github.com/sagernet/sing/common/atomic"
 )
 

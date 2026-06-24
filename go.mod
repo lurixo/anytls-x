@@ -1,4 +1,4 @@
-module github.com/anytls/sing-anytls
+module github.com/lurixo/anytls-x
 
 go 1.23.1
 

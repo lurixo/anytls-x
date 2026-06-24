@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anytls/sing-anytls/padding"
+	"github.com/lurixo/anytls-x/padding"
 	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/logger"
 )

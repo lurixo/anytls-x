@@ -1,4 +1,4 @@
-package anytls
+package anytlsx
 
 import (
 	"context"
@@ -8,8 +8,8 @@ import (
 	"net"
 	"os"
 
-	"github.com/anytls/sing-anytls/padding"
-	"github.com/anytls/sing-anytls/session"
+	"github.com/lurixo/anytls-x/padding"
+	"github.com/lurixo/anytls-x/session"
 	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
