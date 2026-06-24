@@ -21,6 +21,10 @@ type ClientConfig struct {
 	IdleSessionCheckInterval time.Duration
 	IdleSessionTimeout       time.Duration
 	MinIdleSession           int
+	MaxSession               int
+	HeartbeatInterval        time.Duration
+	HeartbeatQuietWindow     time.Duration
+	HeartbeatTimeout         time.Duration
 	DialOut                  util.DialOutFunc
 	Logger                   logger.ContextLogger
 }
@@ -40,7 +44,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	}
 	// Initialize the padding state of this client
 	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &c.padding)
-	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MinIdleSession)
+	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MinIdleSession, config.MaxSession, config.HeartbeatInterval, config.HeartbeatQuietWindow, config.HeartbeatTimeout)
 	return c, nil
 }
 
@@ -83,6 +87,10 @@ func (c *Client) createOutboundConnection(ctx context.Context) (net.Conn, error)
 	}
 
 	return conn, nil
+}
+
+func (h *Client) Reset() {
+	h.sessionClient.Reset()
 }
 
 func (h *Client) Close() error {

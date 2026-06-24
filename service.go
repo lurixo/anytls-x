@@ -21,7 +21,7 @@ import (
 )
 
 type Service struct {
-	users           map[[32]byte]string
+	users           atomic.TypedValue[map[[32]byte]string]
 	padding         atomic.TypedValue[*padding.PaddingFactory]
 	handler         N.TCPConnectionHandlerEx
 	fallbackHandler N.TCPConnectionHandlerEx
@@ -46,16 +46,13 @@ func NewService(config ServiceConfig) (*Service, error) {
 		handler:         config.Handler,
 		fallbackHandler: config.FallbackHandler,
 		logger:          config.Logger,
-		users:           make(map[[32]byte]string),
 	}
 
 	if service.handler == nil || service.logger == nil {
 		return nil, os.ErrInvalid
 	}
 
-	for _, user := range config.Users {
-		service.users[sha256.Sum256([]byte(user.Password))] = user.Name
-	}
+	service.users.Store(buildUserMap(config.Users))
 
 	if !padding.UpdatePaddingScheme(config.PaddingScheme, &service.padding) {
 		return nil, errors.New("incorrect padding scheme format")
@@ -64,12 +61,20 @@ func NewService(config ServiceConfig) (*Service, error) {
 	return service, nil
 }
 
-func (s *Service) UpdateUsers(users []User) {
-	u := make(map[[32]byte]string)
+func buildUserMap(users []User) map[[32]byte]string {
+	u := make(map[[32]byte]string, len(users))
 	for _, user := range users {
 		u[sha256.Sum256([]byte(user.Password))] = user.Name
 	}
-	s.users = u
+	return u
+}
+
+// UpdateUsers atomically swaps the whole user table. The table is treated
+// as immutable copy-on-write: NewConnection only ever Loads and reads the
+// map (never mutates it), so a hot update can never race the auth-path
+// lookup and the map is always internally consistent.
+func (s *Service) UpdateUsers(users []User) {
+	s.users.Store(buildUserMap(users))
 }
 
 // NewConnection `conn` should be plaintext
@@ -90,7 +95,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 	}
 	var passwordSha256 [32]byte
 	copy(passwordSha256[:], by)
-	if user, ok := s.users[passwordSha256]; ok {
+	if user, ok := s.users.Load()[passwordSha256]; ok {
 		ctx = auth.ContextWithUser(ctx, user)
 	} else {
 		b.Resize(0, n)

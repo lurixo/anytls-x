@@ -21,6 +21,7 @@ const ( // cmds
 
 const (
 	headerOverHeadSize = 1 + 4 + 2
+	maxFrameDataLen    = 0xFFFF // math.MaxUint16 — protocol max payload per frame
 )
 
 // frame defines a packet from or to be multiplexed into a single connection

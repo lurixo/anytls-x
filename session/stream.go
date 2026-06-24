@@ -5,12 +5,12 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anytls/sing-anytls/pipe"
 )
 
-// Stream implements net.Conn
 type Stream struct {
 	id uint32
 
@@ -22,9 +22,14 @@ type Stream struct {
 
 	dieOnce sync.Once
 	dieHook func()
-	dieErr  error
+	dieErr  atomic.Pointer[error]
 
 	reportOnce sync.Once
+
+	// synTimer is the per-stream SYNACK timeout (client only, sid >= 2).
+	// Fires if the server does not acknowledge the stream within the deadline.
+	// Only closes this stream; may also close session if no SYNACK received.
+	synTimer *time.Timer
 }
 
 // newStream initiates a Stream struct
@@ -37,24 +42,24 @@ func newStream(id uint32, sess *Session) *Stream {
 	return s
 }
 
-// Read implements net.Conn
 func (s *Stream) Read(b []byte) (n int, err error) {
 	n, err = s.pipeR.Read(b)
-	if n == 0 && s.dieErr != nil {
-		err = s.dieErr
+	if n == 0 {
+		if ep := s.dieErr.Load(); ep != nil {
+			err = *ep
+		}
 	}
 	return
 }
 
-// Write implements net.Conn
 func (s *Stream) Write(b []byte) (n int, err error) {
 	select {
 	case <-s.writeDeadline.Wait():
 		return 0, os.ErrDeadlineExceeded
 	default:
 	}
-	if s.dieErr != nil {
-		return 0, s.dieErr
+	if ep := s.dieErr.Load(); ep != nil {
+		return 0, *ep
 	}
 	n, err = s.sess.writeDataFrame(s.id, b)
 	return
@@ -69,7 +74,11 @@ func (s *Stream) Close() error {
 func (s *Stream) closeLocally() {
 	var once bool
 	s.dieOnce.Do(func() {
-		s.dieErr = net.ErrClosed
+		if s.synTimer != nil {
+			s.synTimer.Stop()
+		}
+		e := error(net.ErrClosed)
+		s.dieErr.Store(&e)
 		s.pipeR.Close()
 		once = true
 	})
@@ -84,7 +93,10 @@ func (s *Stream) closeLocally() {
 func (s *Stream) closeWithError(err error) error {
 	var once bool
 	s.dieOnce.Do(func() {
-		s.dieErr = err
+		if s.synTimer != nil {
+			s.synTimer.Stop()
+		}
+		s.dieErr.Store(&err)
 		s.pipeR.Close()
 		once = true
 	})
@@ -95,7 +107,10 @@ func (s *Stream) closeWithError(err error) error {
 		}
 		return s.sess.streamClosed(s.id)
 	} else {
-		return s.dieErr
+		if ep := s.dieErr.Load(); ep != nil {
+			return *ep
+		}
+		return io.ErrClosedPipe
 	}
 }
 
@@ -139,7 +154,7 @@ func (s *Stream) HandshakeFailure(err error) error {
 	s.reportOnce.Do(func() {
 		once = true
 	})
-	if once && err != nil && s.sess.peerVersion >= 2 {
+	if once && err != nil && s.sess.peerVersion.Load() >= 2 {
 		f := newFrame(cmdSYNACK, s.id)
 		f.data = []byte(err.Error())
 		if _, err := s.sess.writeControlFrame(f); err != nil {
@@ -155,7 +170,7 @@ func (s *Stream) HandshakeSuccess() error {
 	s.reportOnce.Do(func() {
 		once = true
 	})
-	if once && s.sess.peerVersion >= 2 {
+	if once && s.sess.peerVersion.Load() >= 2 {
 		if _, err := s.sess.writeControlFrame(newFrame(cmdSYNACK, s.id)); err != nil {
 			return err
 		}
